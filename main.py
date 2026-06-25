@@ -60,7 +60,44 @@ SPOT_TERMS = [
     "new listing",
     "spot listing",
     "trading is now live",
-    "available for trading",
+    "available for trading",    "delist",
+    "delisting",
+    "will delist",
+    "to delist",
+    "delisted",
+    "remove trading pair",
+    "remove trading pairs",
+    "trading pairs will be removed",
+    "will remove",
+    "cease trading",
+    "ceases trading",
+    "trading suspension",
+    "suspend trading",
+    "suspended trading",
+    "terminate trading",
+    "ends trading",
+    "remove from spot",
+
+]
+
+DELISTING_TERMS = [
+    "delist",
+    "delisting",
+    "will delist",
+    "to delist",
+    "delisted",
+    "remove trading pair",
+    "remove trading pairs",
+    "trading pairs will be removed",
+    "will remove",
+    "cease trading",
+    "ceases trading",
+    "trading suspension",
+    "suspend trading",
+    "suspended trading",
+    "terminate trading",
+    "ends trading",
+    "remove from spot",
 ]
 
 BLOCK_TERMS = [
@@ -442,9 +479,15 @@ def detect_spot_listing(source: str, message_id: int, text: str) -> Optional[Lis
     return classify_spot_listing(source, message_id, text)[0]
 
 
+
+def is_delisting_news(text: str) -> bool:
+    t = (text or "").lower()
+    return any(term in t for term in DELISTING_TERMS)
+
 def build_turkish_alert(hit: ListingHit) -> str:
+    alert_title = "⚠️ DELISTING ALARMI" if is_delisting_news(hit.raw_text) else "🚨 SPOT LISTING ALARMI"
     return (
-        "🚨 SPOT LISTING ALARMI\n\n"
+        f"{alert_title}\n\n"
         f"Kaynak: {hit.source}\n"
         f"Coin: {hit.coin}\n"
         f"Parite: {hit.pair}\n"
