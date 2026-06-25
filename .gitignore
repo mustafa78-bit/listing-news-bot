@@ -1,7 +1,10 @@
 __pycache__/
 *.pyc
 .env
+*.env
 *.db
 *.session
+*.session-journal
+*.log
 .venv/
 venv/
