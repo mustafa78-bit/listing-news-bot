@@ -1,4 +1,6 @@
 import asyncio
+import fcntl
+import json
 import logging
 import os
 import re
@@ -20,6 +22,8 @@ logging.basicConfig(
     format="%(asctime)s %(levelname)s %(message)s",
 )
 log = logging.getLogger("spot-listing-bot")
+LOCK_PATH = "listing_news_bot.lock"
+_LOCK_HANDLE = None
 
 
 SOURCE_CHANNELS = [
@@ -52,13 +56,11 @@ SPOT_TERMS = [
     "spot trading pair",
     "spot trading pairs",
     "open trading for",
-    "opens trading for",
     "will list",
-    "lists",
-    "listed on",
-    "adds",
     "new listing",
     "spot listing",
+    "trading is now live",
+    "available for trading",
 ]
 
 BLOCK_TERMS = [
@@ -82,6 +84,28 @@ BLOCK_TERMS = [
     "vip loan",
     "delist",
     "delisting",
+    "stickers",
+    "survey",
+    "feedback",
+]
+
+STRICT_NEWS_CHANNELS = {
+    "bloomberg",
+    "the_block_crypto",
+    "coindeskglobal",
+    "crypto_fundraising",
+    "dwflabs",
+}
+
+STRICT_NEWS_SPOT_TERMS = [
+    "spot trading",
+    "spot listing",
+]
+
+CMC_NON_EXCHANGE_TERMS = [
+    "listed on coinmarketcap",
+    "listed on cmc",
+    "new cryptos listed on coinmarketcap",
 ]
 
 
@@ -146,6 +170,38 @@ class StateStore:
                         message_id INTEGER NOT NULL,
                         created_at TEXT NOT NULL,
                         PRIMARY KEY (source_channel, message_id)
+                    )
+                    """
+                )
+                cur.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS message_audit (
+                        source_channel TEXT NOT NULL,
+                        message_id INTEGER NOT NULL,
+                        processed_at TEXT NOT NULL,
+                        decision TEXT NOT NULL,
+                        reason TEXT NOT NULL,
+                        coin TEXT,
+                        pair TEXT,
+                        PRIMARY KEY (source_channel, message_id)
+                    )
+                    """
+                )
+                cur.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS bot_metrics (
+                        key TEXT PRIMARY KEY,
+                        value INTEGER NOT NULL DEFAULT 0,
+                        updated_at TEXT NOT NULL
+                    )
+                    """
+                )
+                cur.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS bot_health (
+                        key TEXT PRIMARY KEY,
+                        value TEXT NOT NULL,
+                        updated_at TEXT NOT NULL
                     )
                     """
                 )
@@ -218,6 +274,77 @@ class StateStore:
                 )
             conn.commit()
 
+    def increment_metric(self, key: str, amount: int = 1) -> None:
+        now = datetime.now(timezone.utc).isoformat()
+        with closing(self._connect()) as conn:
+            cur = conn.cursor()
+            if self.is_postgres:
+                cur.execute(
+                    """
+                    INSERT INTO bot_metrics(key, value, updated_at)
+                    VALUES (%s, %s, NOW())
+                    ON CONFLICT (key)
+                    DO UPDATE SET value = bot_metrics.value + EXCLUDED.value, updated_at = NOW()
+                    """,
+                    (key, amount),
+                )
+            else:
+                cur.execute(
+                    """
+                    INSERT INTO bot_metrics(key, value, updated_at)
+                    VALUES (?, ?, ?)
+                    ON CONFLICT(key)
+                    DO UPDATE SET value = value + excluded.value, updated_at = excluded.updated_at
+                    """,
+                    (key, amount, now),
+                )
+            conn.commit()
+
+    def set_health(self, key: str, value: object) -> None:
+        now = datetime.now(timezone.utc).isoformat()
+        text = json.dumps(value, ensure_ascii=True, sort_keys=True) if not isinstance(value, str) else value
+        with closing(self._connect()) as conn:
+            cur = conn.cursor()
+            if self.is_postgres:
+                cur.execute(
+                    """
+                    INSERT INTO bot_health(key, value, updated_at)
+                    VALUES (%s, %s, NOW())
+                    ON CONFLICT (key)
+                    DO UPDATE SET value = EXCLUDED.value, updated_at = NOW()
+                    """,
+                    (key, text),
+                )
+            else:
+                cur.execute(
+                    """
+                    INSERT INTO bot_health(key, value, updated_at)
+                    VALUES (?, ?, ?)
+                    ON CONFLICT(key)
+                    DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at
+                    """,
+                    (key, text, now),
+                )
+            conn.commit()
+
+    def audit_message(self, channel: str, message_id: int, decision: str, reason: str, hit: ListingHit | None = None) -> None:
+        now = datetime.now(timezone.utc).isoformat()
+        with closing(self._connect()) as conn:
+            cur = conn.cursor()
+            if self.is_postgres:
+                return
+            cur.execute(
+                """
+                INSERT INTO message_audit(source_channel, message_id, processed_at, decision, reason, coin, pair)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(source_channel, message_id)
+                DO UPDATE SET processed_at = excluded.processed_at, decision = excluded.decision,
+                    reason = excluded.reason, coin = excluded.coin, pair = excluded.pair
+                """,
+                (channel, message_id, now, decision, reason, hit.coin if hit else None, hit.pair if hit else None),
+            )
+            conn.commit()
+
 
 def env_required(name: str) -> str:
     value = os.getenv(name, "").strip()
@@ -239,13 +366,30 @@ def contains_any(text: str, terms: Iterable[str]) -> bool:
     return any(term in low for term in terms)
 
 
+def acquire_single_instance_lock() -> None:
+    global _LOCK_HANDLE
+    _LOCK_HANDLE = open(LOCK_PATH, "a+", encoding="utf-8")
+    try:
+        fcntl.flock(_LOCK_HANDLE.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        raise SystemExit(f"Another listing-news-bot instance is already running: {LOCK_PATH}")
+    _LOCK_HANDLE.seek(0)
+    _LOCK_HANDLE.truncate()
+    _LOCK_HANDLE.write(str(os.getpid()))
+    _LOCK_HANDLE.flush()
+
+
 def extract_coin(text: str) -> Optional[str]:
     patterns = [
-        r"\(([A-Z0-9]{2,12})\)",
-        r"\$([A-Z0-9]{2,12})\b",
         r"\b([A-Z0-9]{2,12})/USDT\b",
         r"\b([A-Z0-9]{2,12})/USDC\b",
         r"\b([A-Z0-9]{2,12})/FDUSD\b",
+        r"\b([A-Z0-9]{2,12})\s*-\s*(?:USD|USDT|USDC|FDUSD)\b",
+        r"\$([A-Z0-9]{2,12})\b",
+        r"\(([A-Z0-9]{2,12})\)",
+        r"\bwill\s+list\s+([A-Z0-9]{2,12})\b",
+        r"\bnew\s+listing\s*:\s*([A-Z0-9]{2,12})\b",
+        r"\blisting\s*:\s*([A-Z0-9]{2,12})\b",
         r"\blist(?:s|ed|ing)?\s+([A-Z0-9]{2,12})\b",
     ]
     for pattern in patterns:
@@ -264,22 +408,24 @@ def extract_pair(text: str, coin: str) -> str:
     return "BELIRSIZ"
 
 
-def detect_spot_listing(source: str, message_id: int, text: str) -> Optional[ListingHit]:
+def classify_spot_listing(source: str, message_id: int, text: str) -> tuple[Optional[ListingHit], str]:
     if not text:
-        return None
+        return None, "empty_text"
+
+    channel = normalize_channel(source).lower()
+    low = text.lower()
 
     if not contains_any(text, SPOT_TERMS):
-        return None
+        return None, "missing_spot_term"
 
     if contains_any(text, BLOCK_TERMS):
-        return None
+        return None, "blocked_term"
 
-    low = text.lower()
-    if "spot" not in low and normalize_channel(source).lower() not in {
-        "coinmarketcapannouncements",
-        "coinlistofficialchannel",
-    }:
-        return None
+    if channel == "coinmarketcapannouncements" and contains_any(text, CMC_NON_EXCHANGE_TERMS):
+        return None, "cmc_non_exchange_listing"
+
+    if channel in STRICT_NEWS_CHANNELS and not contains_any(text, STRICT_NEWS_SPOT_TERMS):
+        return None, "strict_news_without_spot_listing"
 
     coin = extract_coin(text)
     pair = extract_pair(text, coin)
@@ -289,7 +435,11 @@ def detect_spot_listing(source: str, message_id: int, text: str) -> Optional[Lis
         pair=pair,
         message_url=message_link(source, message_id),
         raw_text=" ".join(text.split())[:700],
-    )
+    ), "spot_listing"
+
+
+def detect_spot_listing(source: str, message_id: int, text: str) -> Optional[ListingHit]:
+    return classify_spot_listing(source, message_id, text)[0]
 
 
 def build_turkish_alert(hit: ListingHit) -> str:
@@ -307,8 +457,13 @@ def build_turkish_alert(hit: ListingHit) -> str:
     )
 
 
-async def send_alert(bot: TelegramClient, chat_id: str, text: str) -> None:
-    await bot.send_message(chat_id, text, link_preview=False)
+async def send_alert(bot: TelegramClient, chat_id, text: str) -> None:
+    target = chat_id
+    if isinstance(target, str):
+        target = target.strip()
+        if target.lstrip("-").isdigit():
+            target = int(target)
+    await bot.send_message(target, text, link_preview=False)
 
 
 async def process_channel(
@@ -329,15 +484,30 @@ async def process_channel(
     for message in messages:
         newest_seen = max(newest_seen, int(message.id))
         text = message.message or ""
-        hit = detect_spot_listing(channel, int(message.id), text)
+        store.increment_metric("messages_processed")
+        hit, reason = classify_spot_listing(channel, int(message.id), text)
         if hit and not store.alert_was_sent(channel, int(message.id)):
-            await send_alert(sender, alert_chat_id, build_turkish_alert(hit))
-            store.mark_alert_sent(channel, int(message.id))
-            log.info("Spot listing alert sent: %s message=%s", channel, message.id)
+            try:
+                await send_alert(sender, alert_chat_id, build_turkish_alert(hit))
+                store.mark_alert_sent(channel, int(message.id))
+                store.audit_message(channel, int(message.id), "sent", reason, hit)
+                store.increment_metric("alerts_sent")
+                log.info("Spot listing alert sent: %s message=%s", channel, message.id)
+            except Exception:
+                store.audit_message(channel, int(message.id), "send_failed", "telegram_send_failed", hit)
+                store.increment_metric("alerts_failed")
+                raise
+        elif hit:
+            store.audit_message(channel, int(message.id), "duplicate", "already_sent", hit)
+            store.increment_metric("alerts_duplicate")
+        else:
+            store.audit_message(channel, int(message.id), "filtered", reason, None)
+            store.increment_metric(f"filtered_{reason}")
 
         store.set_last_id(channel, int(message.id))
 
     if messages:
+        store.set_health("last_successful_channel", {"channel": channel, "last_id": newest_seen, "count": len(messages)})
         log.info("Processed %s messages from %s; last_id=%s", len(messages), channel, newest_seen)
 
 
@@ -346,18 +516,22 @@ async def run_once(reader: TelegramClient, sender: TelegramClient, store: StateS
         try:
             await process_channel(reader, sender, store, alert_chat_id, normalize_channel(channel))
         except Exception:
+            store.increment_metric("channel_failures")
+            store.set_health("last_error", {"channel": channel, "time": datetime.now(timezone.utc).isoformat()})
             log.exception("Channel failed: %s", channel)
             raise
 
 
 async def main() -> None:
+    acquire_single_instance_lock()
     api_id = int(env_required("TELEGRAM_API_ID"))
     api_hash = env_required("TELEGRAM_API_HASH")
     session_string = env_required("TELEGRAM_SESSION_STRING")
     alert_bot_token = env_required("ALERT_BOT_TOKEN")
-    alert_chat_id = env_required("ALERT_CHAT_ID")
+    alert_chat_id = int(env_required("ALERT_CHAT_ID"))
 
     store = StateStore()
+    store.set_health("pid", os.getpid())
     reader = TelegramClient(StringSession(session_string), api_id, api_hash)
     sender = TelegramClient("alert_bot", api_id, api_hash)
 
